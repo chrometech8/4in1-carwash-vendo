@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <HTTPUpdate.h>
 #include <LiquidCrystal_PCF8574.h>
 #include <EEPROM.h>
 #include <esp_system.h>
@@ -788,13 +789,14 @@ void DisplayAdminSettings() {
   const int mainMaxOptions = 3;
   bool inExtendedMenu = false;
 
-  const int totalExtendedOptions = 5;
+  const int totalExtendedOptions = 6;
   String extendedOptions[totalExtendedOptions] = {
     "Activate Machine",
     "Time Increment",
     "Change Display",
     "Change Password",
-    "Connect to WiFi"
+    "Connect to WiFi",
+    "Update Machine"
   };
   int currentExtendedIndex = 0;
   const int itemsPerPage = 3;
@@ -901,6 +903,9 @@ void DisplayAdminSettings() {
               break;
             case 4:
               connectToInternetSettings(); // Flush at start if needed
+              break;
+            case 5:
+              updateMachine();
               break;
           }
         }
@@ -2433,3 +2438,109 @@ void sendTransactionToBackend(int serviceIndex, int amount) {
   }
   http.end();
 }
+
+// Helper function to query GitHub API for the latest firmware URL
+String getLatestFirmwareURL() {
+  String apiUrl = "https://api.github.com/repos/chrometech8/4in1-carwash-vendo/releases/latest";
+  String firmwareUrl = "";
+  
+  WiFiClientSecure client;
+  client.setInsecure();  // Disable certificate validation
+  HTTPClient http;
+  
+  http.begin(client, apiUrl);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      // Loop through the assets array to find the asset ending with ".merged.bin"
+      JsonArray assets = doc["assets"].as<JsonArray>();
+      for (JsonObject asset : assets) {
+        String name = asset["name"].as<String>();
+        if (name.endsWith(".merged.bin")) {
+          firmwareUrl = asset["browser_download_url"].as<String>();
+          break;
+        }
+      }
+    } else {
+      Serial.println("JSON parse error in getLatestFirmwareURL");
+    }
+  } else {
+    Serial.printf("GitHub API HTTP error: %d\n", httpCode);
+  }
+  http.end();
+  return firmwareUrl;
+}
+
+void updateMachine() {
+  // Use static variables to track state
+  static bool updateStarted = false;
+  static unsigned long updateStartTime = 0;
+  static String latestFirmwareUrl = "";
+  
+  // On the first call, fetch the latest firmware URL and start the update
+  if (!updateStarted) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Fetching Update...");
+    
+    latestFirmwareUrl = getLatestFirmwareURL();
+    if (latestFirmwareUrl == "") {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("No Update Info");
+      updateStartTime = millis();
+      updateStarted = true;
+      return;
+    }
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Updating...");
+    
+    // Create a secure client for HTTPS and disable certificate validation
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    // Instantiate HTTPUpdate and perform the update using the URL from GitHub API
+    HTTPUpdate httpUpdate;
+    HTTPUpdateResult ret = httpUpdate.update(client, latestFirmwareUrl.c_str());
+    
+    switch(ret) {
+      case HTTP_UPDATE_FAILED:
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Update Failed");
+        Serial.printf("Update failed: %s\n", httpUpdate.getLastErrorString().c_str());
+        break;
+      case HTTP_UPDATE_NO_UPDATES:
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("No Update");
+        break;
+      case HTTP_UPDATE_OK:
+        // On success, the ESP32 will reboot automatically.
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Update Success");
+        break;
+    }
+    
+    updateStartTime = millis();
+    updateStarted = true;
+  }
+  // On subsequent calls, wait non-blockingly until 2000ms have elapsed before returning to admin settings.
+  else {
+    if (millis() - updateStartTime >= 2000) {
+      updateStarted = false;  // Reset update state for future updates
+      DisplayAdminSettings();
+    }
+  }
+}
+
+
+
+
+
